@@ -8,6 +8,7 @@ from numba import jit, guvectorize, int64
 import pyfftw
 from rfpipe import util, candidates, source
 import scipy.stats
+import hdbscan
 
 import logging
 logger = logging.getLogger(__name__)
@@ -29,9 +30,9 @@ def prep_and_search(st, segment, data):
     data = source.data_prep(st, segment, data)
 
     if st.prefs.fftmode == "cuda":
-        candcollection = dedisperse_image_cuda(st, segment, data)
+        candcollection = dedisperse_search_cuda(st, segment, data)
     elif st.prefs.fftmode == "fftw":
-        candcollection = dedisperse_image_fftw(st, segment, data)
+        candcollection = dedisperse_search_fftw(st, segment, data)
     else:
         logger.warn("fftmode {0} not recognized (cuda, fftw allowed)"
                     .format(st.prefs.fftmode))
@@ -41,7 +42,7 @@ def prep_and_search(st, segment, data):
     return candcollection
 
 
-def dedisperse_image_cuda(st, segment, data, devicenum=None):
+def dedisperse_search_cuda(st, segment, data, devicenum=None):
     """ Run dedispersion, resample for all dm and dt.
     Grid and image on GPU.
     rfgpu is built from separate repo.
@@ -125,6 +126,16 @@ def dedisperse_image_cuda(st, segment, data, devicenum=None):
         # TODO: check that this is ok if pointing at bright source
         spec_std = data.real.mean(axis=1).mean(axis=2).std(axis=0)
         sig_ts, kalman_coeffs = kalman_prepare_coeffs(spec_std)
+        if not np.all(sig_ts):
+            logger.info("sig_ts all zeros. Skipping search.")
+            return candidates.CandCollection(prefs=st.prefs,
+                                             metadata=st.metadata)
+
+    # place to hold intermediate result lists
+    canddict = {}
+    canddict['candloc'] = []
+    for feat in st.features:
+        canddict[feat] = []
 
     canddatalist = []
     for dtind in range(len(st.dtarr)):
@@ -150,6 +161,8 @@ def dedisperse_image_cuda(st, segment, data, devicenum=None):
                                 st.npixy, st.uvres, devicenum))
 
             for i in integrations:
+                candloc = (segment, integrations[i], dmind, dtind, beamnum)
+
                 # grid and FFT
                 grid.operate(vis_raw, vis_grid, i)
                 image.operate(vis_grid, img_grid)
@@ -157,40 +170,34 @@ def dedisperse_image_cuda(st, segment, data, devicenum=None):
                 # calc snr
                 stats = image.stats(img_grid)
                 if stats['rms'] != 0.:
-                    peak_snr = stats['max']/stats['rms']
+                    snr1 = stats['max']/stats['rms']
+                    immax1 = stats['max']
                     # TODO: add lm calc to rfgpu
-                    # l, m = stats['peak_l'], stats['peak_m']
+                    # l1, m1 = stats['peak_l'], stats['peak_m']
                 else:
                     peak_snr = 0.
 
-                # TODO: collect candlocs/snr and close loops here to find peaks
-                #       then return to create canddata per peak or island
-
-                # threshold image on GPU and optionally save it
+                # threshold image
                 if peak_snr > st.prefs.sigma_image1:
-                    img_grid.d2h()  # TODO: implement l,m and phasing on GPU
+                    # TODO: implement peak l,m
+                    img_grid.d2h()
                     img_data = np.fft.fftshift(img_grid.data)  # shift zero pixel in middle
-                    l, m = st.pixtolm(np.where(img_data == img_data.max()))
-                    candloc = (segment, i, dmind, dtind, beamnum)
-                    data_corr = dedisperseresample(data, delay,
-                                                   st.dtarr[dtind],
-                                                   parallel=st.prefs.nthread > 1)
+                    l1, m1 = st.pixtolm(np.where(img_data == img_data.max()))
 
                     if st.prefs.searchtype == 'image':
-                        logger.info("Got one! SNR {0:.1f} candidate at {1} and (l,m) = ({2},{3})"
-                                    .format(peak_snr, candloc, l, m))
-
-                        data_corr = data_corr[max(0, i-st.prefs.timewindow//2):
-                                              min(i+st.prefs.timewindow//2,
-                                              len(data))]
-                        util.phase_shift(data_corr, uvw, l, m)
-                        data_corr = data_corr.mean(axis=1)
-                        canddatalist.append(candidates.CandData(state=st,
-                                                                loc=candloc,
-                                                                image=img_data,
-                                                                data=data_corr))
+                        logger.info("Got one! SNR1 {0:.1f} candidate at {1} and (l, m) = ({2},{3})"
+                                    .format(snr1, candloc, l1, m1))
+                        canddict['candloc'].append(candloc)
+                        canddict['l1'].append(l1)
+                        canddict['m1'].append(m1)
+                        canddict['snr1'].append(snr1)
+                        canddict['immax1'].append(immax1)
 
                     elif st.prefs.searchtype == 'imagek':
+                        # TODO: implement phasing on GPU
+                        data_corr = dedisperseresample(data, delay,
+                                                       st.dtarr[dtind],
+                                                       parallel=st.prefs.nthread > 1)
                         spec = data_corr.take([i], axis=0)
                         util.phase_shift(spec, uvw, l, m)
                         spec = spec[0].real.mean(axis=2).mean(axis=0)
@@ -205,18 +212,13 @@ def dedisperse_image_cuda(st, segment, data, devicenum=None):
                         snrtot = (snrk**2 + peak_snr**2)**0.5
                         if snrtot > (st.prefs.sigma_kalman**2 + st.prefs.sigma_image1**2)**0.5:
                             logger.info("Got one! SNR1 {0:.1f} and SNRk {1:.1f} candidate at {2} and (l,m) = ({3},{4})"
-                                        .format(peak_snr, snrk, candloc, l, m))
-
-                            data_corr = data_corr[max(0, i-st.prefs.timewindow//2):
-                                                  min(i+st.prefs.timewindow//2,
-                                                  len(data))]
-                            util.phase_shift(data_corr, uvw, l, m)
-                            data_corr = data_corr.mean(axis=1)
-                            canddatalist.append(candidates.CandData(state=st,
-                                                                    loc=candloc,
-                                                                    image=img_data,
-                                                                    data=data_corr,
-                                                                    snrk=snrk))
+                                        .format(peak_snr, snrk, candloc, l1, m1))
+                            canddict['candloc'].append(candloc)
+                            canddict['l1'].append(l1)
+                            canddict['m1'].append(m1)
+                            canddict['snr1'].append(peak_snr)
+                            canddict['immax1'].append(immax1)
+                            canddict['snrk'].append(snrk)
                     elif st.prefs.searchtype == 'armkimage':
                         raise NotImplementedError
                     elif st.prefs.searchtype == 'armk':
@@ -225,24 +227,18 @@ def dedisperse_image_cuda(st, segment, data, devicenum=None):
                         logger.warn("searchtype {0} not recognized"
                                     .format(st.prefs.searchtype))
 
-                    # TODO: add safety against triggering return of all images
-                    if len(canddatalist)*bytespercd/1000**3 > st.prefs.memory_limit:
-                        logger.info("Accumulated CandData size exceeds "
-                                    "memory limit of {0:.1f}. "
-                                    "Running calc_features..."
-                                    .format(st.prefs.memory_limit))
-                        candcollection += candidates.calc_features(canddatalist)
-                        canddatalist = []
+    cc0 = candidates.make_candcollection(st, **canddict)
+    logger.info("First pass found {0} candidates in seg {1}."
+                .format(len(cc0), segment))
 
-    candcollection += candidates.calc_features(canddatalist)
+    # find clusters and save/plot for peak of each cluster
+    cc1 = candidates.cluster_candidates(cc0)  # adds cluster field to cc0
+    calc_cluster_features(cc1, data)
 
-    logger.info("{0} candidates returned for seg {1}"
-                .format(len(candcollection), segment))
-
-    return candcollection
+    return cc1
 
 
-def dedisperse_image_fftw(st, segment, data, wisdom=None):
+def dedisperse_search_fftw(st, segment, data, wisdom=None):
     """ Fuse the dediserpse, resample, search, threshold functions.
     Returns list of CandData objects that define candidates with
     candloc, image, and phased visibility data.
@@ -388,71 +384,73 @@ def dedisperse_image_fftw(st, segment, data, wisdom=None):
                 raise NotImplemented("only searchtype=image, imagek, armk, armkimage implemented")
 
     cc0 = candidates.make_candcollection(st, **canddict)
-    logger.info("Found {0} candidates in seg {1}."
+    logger.info("First pass found {0} candidates in seg {1}."
                 .format(len(cc0), segment))
 
-    # TODO: get canddata for cluster filtered set of candidates
-#    cc1 = cluster_candidates(cc0)
-#    cc2 = make_canddata(cc1, data)
-#    return cc2
+    # find clusters and save/plot for peak of each cluster
+    cc1 = candidates.cluster_candidates(cc0)  # adds cluster field to cc0
+    calc_cluster_features(cc1, data)
 
-    return cc0
+    return cc1
 
 
-def make_canddata(candcollection, data, wisdom=None):
+def calc_cluster_features(candcollection, data, wisdom=None):
+    """ Iterates through candidates and uses location (e.g., integration, dm, dt)
+    to create canddata for each candidate.
     """
-    """
 
-    st = candcollection.state
-    candlocs = candcollection.locs
-    bytespercd = 8*(st.npixx*st.npixy + st.prefs.timewindow*st.nchan*st.npol)
+    if len(candcollection):
+        assert u'cluster' in candcollection.array.dtype.fields
+        clusters = np.unique(candcollection.array[u'cluster'].astype(int)).tolist()
+        # TODO: decide how to deal with unclustered candidates
+        if -1 in clusters:
+            clusters.remove(-1)
 
-    canddatalist = []
-    for candloc in candlocs:
-        (segment, integration, dmind, dtind, beamnum) = candloc
-        delay = util.calc_delay(st.freq, st.freq.max(), st.dmarr[dmind],
-                                st.inttime)
-        data_corr = dedisperseresample(data, delay,
-                                       st.dtarr[dtind],
-                                       parallel=st.prefs.nthread > 1)
+        st = candcollection.state
+        candlocs = candcollection.locs
+        ls = candcollection.array[u'l1']
+        ms = candcollection.array[u'm1']
 
-        uvw = util.get_uvw_segment(st, segment)
-        image = grid_image(data_corr, uvw, st.npixx, st.npixy, st.uvres,
-                           'fftw', st.prefs.nthread, wisdom=wisdom,
-                           integrations=integration)
+        for cluster in clusters:
+            # get max SNR of cluster
+            clusterinds = np.where(cluster == clusters)[0]
+            logger.info("Getting max SNR for cluster {0} with {1} candidates"
+                        .format(cluster, len(clusterinds)))
+            maxsnr = candcollection.array[u'snr1'][clusterinds].max()
+            maxind = np.where(candcollection.array[u'snr1'] == maxsnr)[0][0]
+            # TODO: check on best way to find max SNR with kalman, etc
+            candloc = candlocs[maxind]
 
-        # TODO: validate that reproduced features match input features?
-#        peakx, peaky = np.where(image[0] == image[0].max())
-#        l1, m1 = st.calclm(st.npixx_full, st.npixy_full,
-#                           st.uvres, peakx[0], peaky[0])
-#        immax1 = image.max()
-#        snr1 = immax1/image.std()
+            (segment, integration, dmind, dtind, beamnum) = candloc
+            delay = util.calc_delay(st.freq, st.freq.max(), st.dmarr[dmind],
+                                    st.inttime)
+            data_corr = dedisperseresample(data, delay, st.dtarr[dtind],
+                                           parallel=st.prefs.nthread > 1)
 
-        data_corr = data_corr[max(0, integration-st.prefs.timewindow//2):
-                              min(integration+st.prefs.timewindow//2,
-                              len(data))]
+            uvw = util.get_uvw_segment(st, segment)
+            image = grid_image(data_corr, uvw, st.npixx, st.npixy, st.uvres,
+                               'fftw', st.prefs.nthread, wisdom=wisdom,
+                               integrations=integration)[0]
 
-        l1 = candcollection['l1']
-        m1 = candcollection['m1']
-        util.phase_shift(data_corr, uvw, l1, m1)
-        data_corr = data_corr.mean(axis=1)
-        canddatalist.append(candidates.CandData(state=st,
-                                                loc=candloc,
-                                                image=image,
-                                                data=data_corr))
-    # TODO: option to add snrarm, snrk
+            data_corr = data_corr[max(0, integration-st.prefs.timewindow//2):
+                                  min(integration+st.prefs.timewindow//2,
+                                  len(data))]
 
-        if len(canddatalist)*bytespercd/1000**3 > st.prefs.memory_limit:
-            logger.info("Accumulated CandData size exceeds "
-                        "memory limit of {0:.1f}. "
-                        "Running calc_features..."
-                        .format(st.prefs.memory_limit))
-            candcollection += candidates.calc_features(canddatalist)
-            canddatalist = []
+            util.phase_shift(data_corr, uvw, ls[maxind], ms[maxind])
+            data_corr = data_corr.mean(axis=1)
+            canddata = candidates.CandData(state=st, loc=candloc, image=image,
+                                           data=data_corr)
+            # TODO: option to add snrarm, snrk
 
-    candcollection = candidates.calc_features(canddatalist)
+            # triggers optional plotting and saving
+            cc = candidates.calc_features(canddata)
 
-    return candcollection
+            # TODO: validate that reproduced features match input features?
+    #        peakx, peaky = np.where(image[0] == image[0].max())
+    #        l1, m1 = st.calclm(st.npixx_full, st.npixy_full,
+    #                           st.uvres, peakx[0], peaky[0])
+    #        immax1 = image.max()
+    #        snr1 = immax1/image.std()
 
 
 def grid_image(data, uvw, npixx, npixy, uvres, fftmode, nthread, wisdom=None,
@@ -465,7 +463,7 @@ def grid_image(data, uvw, npixx, npixy, uvres, fftmode, nthread, wisdom=None,
 
     if integrations is None:
         integrations = list(range(len(data)))
-    elif isinstance(integrations, int):
+    elif not isinstance(integrations, list):
         integrations = [integrations]
 
     if fftmode == 'fftw':
@@ -1008,7 +1006,7 @@ def thresh_arms(arm0, arm1, arm2, T012, sigma_arm, sigma_trigger, n_max_cands):
             for ind1 in indices_arr1:
                 ind2 = projectarms(ind0-npix//2, ind1-npix//2, T012, npix)
                 # check score if intersections are all on grid
-                if ind2 <= npix:
+                if ind2 < npix:
                     score = arm0[i, ind0] + arm1[i, ind1] + arm2[i, ind2]
                 else:
                     score = 0.
@@ -1124,16 +1122,17 @@ def kalman_filter_detector(spec, spec_std, sig_t, A_0=None, sig_0=None):
     return cur_log_l - H_0_log_likelihood
 
 
-def kalman_prepare_coeffs(data_std, sig_ts=None, n_trial=10000):
+def kalman_prepare_coeffs(spec_std, sig_ts=None, n_trial=10000):
     """ Measure kalman significance distribution in random data.
-    data_std is the noise vector per channel.
+    spec_std is the noise spectrum (per channel)
     sig_ts can be single float or list of values.
     returns tuple (sig_ts, coeffs)
     From Barak Zackay
     """
 
+    # calculate sig_ts
     if sig_ts is None:
-        sig_ts = np.array([x*np.median(data_std) for x in [0.3, 0.1, 0.03, 0.01]])
+        sig_ts = np.array([x*np.median(spec_std) for x in [0.3, 0.1, 0.03, 0.01]])
     elif isinstance(sig_ts, float):
         sig_ts = np.array([sig_ts])
     elif isinstance(sig_ts, list):
@@ -1143,16 +1142,29 @@ def kalman_prepare_coeffs(data_std, sig_ts=None, n_trial=10000):
 
     assert isinstance(sig_ts, np.ndarray)
 
+    if not np.all(np.nan_to_num(sig_ts)):
+        logger.warn("sig_ts are bad. Not estimating coeffs.")
+        return sig_ts, []
+
     logger.info("Measuring Kalman significance distribution for sig_ts {0}".format(sig_ts))
+
+    # Are spec_std values ok?
+    if not np.any(spec_std):
+        logger.warn("spectrum std all zeros. Not estimating coeffs.")
+        return sig_ts, []
+    elif len(np.where(spec_std == 0.)[0]) > 0:
+        logger.info("Replacing {0} noise spectrum channels with median noise"
+                    .format(len(np.where(spec_std == 0.)[0])))
+        spec_std = np.where(spec_std == 0, np.median(spec_std), spec_std)
 
     coeffs = []
     for sig_t in sig_ts:
-        nchan = len(data_std)
+        nchan = len(spec_std)
         random_scores = []
         for i in range(n_trial):
-            normaldist = np.random.normal(0, data_std, size=nchan)
+            normaldist = np.random.normal(0, spec_std, size=nchan)
             normaldist -= normaldist.mean()
-            random_scores.append(kalman_filter_detector(normaldist, data_std, sig_t))
+            random_scores.append(kalman_filter_detector(normaldist, spec_std, sig_t))
 
         # Approximating the tail of the distribution as an  exponential tail (probably is justified)
         coeffs.append(np.polyfit([np.percentile(random_scores, 100 * (1 - 2 ** (-i))) for i in range(3, 10)], range(3, 10), 1))
